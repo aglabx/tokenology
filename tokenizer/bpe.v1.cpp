@@ -216,7 +216,6 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        std::cout << std::get<0>(rep) << " " << std::get<1>(rep) << " " << tf << " : ";
         merged.push_back(rep);
         tokens[L] = rep;
         rev_tokens[rep] = L;
@@ -231,7 +230,6 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        std::cout << "replace: ";
         new_seq.clear();
         new_seq.reserve(seq.size());
         for (size_t i = 0; i < seq.size();) {
@@ -247,10 +245,13 @@ int main(int argc, char* argv[]) {
         if (max_tokens && L > max_tokens) {
             break;
         }
-        std::cout << seq.size() << " -> " << new_seq.size();
-        std::cout << " new seq copy ";
+
+        std::string token1 = token_type_to_string(std::get<0>(rep), alphabet, tokens);
+        std::string token2 = token_type_to_string(std::get<1>(rep), alphabet, tokens);
+        std::cout << token1 << " " << token2 << " " << tf << " : "<< "replace: " << seq.size() << " -> " << new_seq.size() << std::endl;
+
         seq = std::vector<TokenType>(new_seq.begin(), new_seq.end());
-        std::cout << "done" << std::endl;
+        
     }
     // compute tokens as strings
     std::map<TokenType, std::string> tokens_str_map;
@@ -262,18 +263,18 @@ int main(int argc, char* argv[]) {
         tokens_str_map[element.second] = element.first;
     }
 
-    std::ofstream out_file(output_file);
-    if (out_file.is_open()) {
-        for (const auto& element : seq) {
-            if (element == 5) {
-                out_file << "\n";
-            } else {
-                out_file << tokens_str_map.at(element) << " ";
-            }
-        }
-        out_file << std::endl;
-        out_file.close();
-    }
+    // std::ofstream out_file(output_file);
+    // if (out_file.is_open()) {
+    //     for (const auto& element : seq) {
+    //         if (element == 5) {
+    //             out_file << "\n";
+    //         } else {
+    //             out_file << tokens_str_map.at(element) << " ";
+    //         }
+    //     }
+    //     out_file << std::endl;
+    //     out_file.close();
+    // }
 
     nlohmann::ordered_json json_data = get_json(tokens_str_map, tokens);
 

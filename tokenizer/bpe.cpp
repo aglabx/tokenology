@@ -14,11 +14,14 @@
 #include <fstream>
 #include "nlohmann/json.hpp"
 #include "tokens_model.hpp"
+#include <mutex>
+#include <thread>
+#include <future>
 #include <execution>
 #include <atomic>
 #include <algorithm>
-#include <execution>
-#include <mutex>
+#include <iterator>
+#include <utility>
 
 
 using json = nlohmann::json;
@@ -27,6 +30,8 @@ typedef std::tuple<TokenType, TokenType> kmer;
 
 const uint N_HELP_TOKENS = 6;
 const uint MAX_N_TOKENS = 65535;
+
+
 
 std::map<std::string, TokenType> alphabet = {
     {"[UNK]", 0},
@@ -125,8 +130,15 @@ std::string get_dataset(const std::vector<std::string>& seqs) {
 std::vector<TokenType> convert_to_vector(std::string& dataset) {
     std::vector<TokenType> seq;
     seq.reserve(dataset.size()); // Reserve space
-    for (const auto& x : dataset) {
-        seq.push_back(alphabet[std::string(1, x)]);
+    for (auto x : dataset) {
+        if (x == '\n') {
+            x = '~';
+        }
+        if (alphabet.find(std::string(1, x)) != alphabet.end()) {
+            seq.push_back(alphabet.at(std::string(1, x)));
+        } else {
+            seq.push_back(alphabet.at("[UNK]"));
+        }
     }
     return seq;
 }
@@ -155,10 +167,79 @@ std::string token_type_to_string(TokenType token, const std::map<std::string, To
 }
 
 
+void compute_freqs(const std::vector<TokenType>& seq, std::vector<std::atomic_size_t>& c, std::vector<std::thread>& threads, size_t n_threads, TokenType L) {
+
+    std::cout << "Computing frequencies" << std::endl;
+
+    auto worker = [&](size_t start, size_t end) {
+        for (size_t i = start; i < end; ++i) {
+            if (seq[i] > N_HELP_TOKENS && seq[i + 1] > N_HELP_TOKENS) {
+                ++c[seq[i] * L + seq[i + 1]];
+            }
+        }
+    };
+    size_t chunk_size = (seq.size() - 1) / n_threads;
+
+    for (size_t i = 0; i < n_threads; ++i) {
+        size_t start = i * chunk_size;
+        size_t end = (i == n_threads - 1) ? seq.size() - 1 : start + chunk_size;
+        threads.emplace_back(worker, start, end);
+    }
+
+    for (auto &t : threads) {
+        t.join();
+    }
+}
+
+std::pair<std::size_t, kmer> found_max(const std::vector<std::atomic_size_t>& c, TokenType L) {
+    std::cout << "find max " << std::endl;
+    size_t max_count = 0;
+    kmer rep;
+    for (size_t i=0; i < c.size(); ++i) {
+        size_t current_count = c[i].load();
+        if (current_count > max_count) {
+            max_count = current_count;
+            rep = std::make_tuple(i / L, i % L);
+        }
+    }
+    return std::make_pair(max_count, rep);
+}
+
+void transform_data(std::vector<TokenType> &seq, std::vector<kmer> &merged, std::map<TokenType, kmer> &tokens, std::unordered_map<kmer, TokenType, tuple_hash<TokenType>> &rev_tokens, size_t max_tokens, std::vector<bool>& to_replace, kmer& rep, size_t tf, std::vector<TokenType>& new_seq,  TokenType L, uint k=2) {
+    
+    
+
+    std::fill(to_replace.begin(), to_replace.end(), false);
+    for (size_t i = 0; i < seq.size() - k + 1; i++) {
+        if (seq[i] > N_HELP_TOKENS && seq[i+1] > N_HELP_TOKENS) {
+            kmer kmer_ = std::make_tuple(seq[i], seq[i+1]);
+            if (kmer_ == rep) {
+                to_replace[i] = true;
+            }
+        }
+    }
+    
+    new_seq.clear();
+    new_seq.reserve(seq.size());
+    for (size_t i = 0; i < seq.size();) {
+        if (to_replace[i]) {
+            new_seq.push_back(L);
+            i += 2;
+        } else {
+            new_seq.push_back(seq[i]);
+            i += 1;
+        }
+    }
+
+    seq = std::vector<TokenType>(new_seq.begin(), new_seq.end());
+    
+}
 
 int main(int argc, char* argv[]) {
-    if (argc != 5) {
-        std::cerr << "Usage: " << argv[0] << " <input_file> <output_file> <output_model_file> <max_tokens>" << std::endl;
+
+    
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0] << " <input_file> <output_file> <output_model_file> <max_tokens> <threads>" << std::endl;
         return 1;
     }
 
@@ -166,6 +247,7 @@ int main(int argc, char* argv[]) {
     std::string output_file = argv[2];
     std::string output_model_file = argv[3];
     size_t max_tokens = std::stoul(argv[4]);
+    size_t n_threads = std::stoul(argv[5]);
 
     if (max_tokens > MAX_N_TOKENS) {
         std::cout << "Max tokens must be less than 65535" << std::endl;
@@ -177,8 +259,10 @@ int main(int argc, char* argv[]) {
     get_sequences_reads(file_name, seqs);
     std::cout << "get dataset" << std::endl;
     std::string dataset = get_dataset(seqs);
+    seqs.clear();
     
     std::vector<TokenType> seq = convert_to_vector(dataset);
+    dataset.clear();
 
     std::vector<kmer> merged;
     uint k = 2;
@@ -191,86 +275,41 @@ int main(int argc, char* argv[]) {
     while (true) {
         std::cout << "Tokens " << L << " count reps ";
 
-        std::vector<std::vector<TokenType>> c(L, std::vector<TokenType>(L, 0));
+       
 
-        // Create a vector of mutexes of size 192
-        std::vector<std::mutex> row_mutexes(192);
+        // Allocate memory for the matrix
+        std::vector<std::atomic_size_t> c(L * L);
+        // Initialize the elements to zero
+        for (auto &elem : c) {
+            elem.store(0);
+        }
 
-        // Create a range of indices for the loop
-        std::vector<size_t> indices(seq.size() - k + 1);
-        std::iota(indices.begin(), indices.end(), 0);
+        std::vector<std::thread> threads;
+        compute_freqs(seq, c, threads, n_threads, L);
 
-        std::for_each(std::execution::par, indices.begin(), indices.end(), [&](size_t i) {
-            if (seq[i] > N_HELP_TOKENS && seq[i + 1] > N_HELP_TOKENS) {
-                std::lock_guard<std::mutex> lock(row_mutexes[seq[i] % 192]);
-                c[seq[i]][seq[i + 1]]++;
-            }
-        });
+        auto max_result = found_max(c, L);
+        size_t tf = max_result.first;
+        kmer rep = max_result.second;
+        if (tf == 1) {
+            break;
+        }
 
-
-        std::cout << "find max ";
-
-        size_t max_count = 0;
-        kmer rep;
-
-        // Mutex for protecting access to max_count and rep
-        std::mutex max_mutex;
-
-        std::vector<size_t> row_indices(c.size());
-        std::iota(row_indices.begin(), row_indices.end(), 0);
-
-        // Parallel loop over rows
-        std::for_each(std::execution::par, row_indices.begin(), row_indices.end(), [&](size_t i) {
-            if (i > 0) {
-                auto row_max_it = std::max_element(c[i].begin() + 1, c[i].end());
-                size_t row_max = *row_max_it;
-                size_t j = std::distance(c[i].begin(), row_max_it);
-
-                std::lock_guard<std::mutex> lock(max_mutex);
-                if (row_max > max_count) {
-                    max_count = row_max;
-                    rep = std::make_tuple(i, j);
-                }
-            }
-        });
-
-        size_t tf = max_count;
-
-        std::cout << std::get<0>(rep) << " " << std::get<1>(rep) << " " << tf << " : ";
         merged.push_back(rep);
         tokens[L] = rep;
         rev_tokens[rep] = L;
-        
-        std::fill(to_replace.begin(), to_replace.end(), false);
-        for (size_t i = 0; i < seq.size() - k + 1; i++) {
-            if (seq[i] > N_HELP_TOKENS && seq[i+1] > N_HELP_TOKENS) {
-                kmer kmer_ = std::make_tuple(seq[i], seq[i+1]);
-                if (kmer_ == rep) {
-                    to_replace[i] = true;
-                }
-            }
-        }
-        
-        std::cout << "replace: ";
-        new_seq.clear();
-        new_seq.reserve(seq.size());
-        for (size_t i = 0; i < seq.size();) {
-            if (to_replace[i]) {
-                new_seq.push_back(L);
-                i += 2;
-            } else {
-                new_seq.push_back(seq[i]);
-                i += 1;
-            }
-        }
+
+        transform_data(seq, merged, tokens, rev_tokens, max_tokens, to_replace, rep, tf, new_seq, L, k);
+
+
+        std::string token1 = token_type_to_string(std::get<0>(rep), alphabet, tokens);
+        std::string token2 = token_type_to_string(std::get<1>(rep), alphabet, tokens);
+        std::cout << token1 << " " << token2 << " " << tf << " : "<< "replace: " << seq.size() << " -> " << new_seq.size() << std::endl;
+
         L += 1;
         if (max_tokens && L > max_tokens) {
             break;
         }
-        std::cout << seq.size() << " -> " << new_seq.size();
-        std::cout << " new seq copy ";
-        seq = std::vector<TokenType>(new_seq.begin(), new_seq.end());
-        std::cout << "done" << std::endl;
+        
     }
     // compute tokens as strings
     std::map<TokenType, std::string> tokens_str_map;
@@ -282,23 +321,23 @@ int main(int argc, char* argv[]) {
         tokens_str_map[element.second] = element.first;
     }
 
-    std::ofstream out_file(output_file);
-    if (out_file.is_open()) {
-        for (const auto& element : seq) {
-            if (element == 5) {
-                out_file << "\n";
-            } else {
-                out_file << tokens_str_map.at(element) << " ";
-            }
-        }
-        out_file << std::endl;
-        out_file.close();
-    }
+    // std::ofstream out_file(output_file);
+    // if (out_file.is_open()) {
+    //     for (const auto& element : seq) {
+    //         if (element == 5) {
+    //             out_file << "\n";
+    //         } else {
+    //             out_file << tokens_str_map.at(element) << " ";
+    //         }
+    //     }
+    //     out_file << std::endl;
+    //     out_file.close();
+    // }
 
-    nlohmann::json json_data = get_json(tokens_str_map, tokens);
+    nlohmann::ordered_json json_data = get_json(tokens_str_map, tokens);
 
     std::ofstream configFile(output_model_file);
-    configFile << std::setw(4) << json_data << std::endl;
+    configFile << std::setw(2) << json_data << std::endl;
     configFile.close();
 
     std::cout << "Config saved to config.json" << std::endl;
